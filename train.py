@@ -9,7 +9,6 @@ import os
 import numpy as np
 import copy
 from tqdm import trange, tqdm
-import math
 from multiprocessing import cpu_count
 
 from tensorboardX import SummaryWriter
@@ -34,7 +33,7 @@ def closest_factors(a):
     closest_factor = min(factors, key=lambda x: abs(x[0] - x[1]))
     return closest_factor
 
-def warmup_lr(step, warmup: int=5000):
+def warmup_lr(step, warmup:int=5000):
     return min(step, warmup) / warmup
 
 def ema(source, target, decay):
@@ -47,6 +46,7 @@ def ema(source, target, decay):
 
 # logging
 logdir = './logs'
+create_directory(logdir)
 sample_dir = './logs/samples'
 model_dir = './logs/model'
 create_directory(sample_dir)
@@ -68,8 +68,8 @@ class CustomDataset(Dataset):
         label_item = self.labels[index]
         return data_item, label_item
     
-data_path = 'all_cifar_sorted.npy'
-label_path = 'kmeans_labels_cifar.npy'
+data_path = '/mnt/store/lyx/github_projs/why/DDPM/all_cifar_sorted.npy'
+label_path = '/mnt/store/lyx/github_projs/why/DDPM/kmeans_labels_cifar.npy'
 all_imgs = np.load(data_path)
 all_labels = np.load(label_path)
 all_labels_th = torch.tensor(all_labels)
@@ -132,11 +132,11 @@ with tqdm(total_steps, dynamic_ncols=True) as pbar:
             init_noise = torch.randn(b, c, h, w).to('cuda')
             samples = diffusion_sampler(init_noise)
             grid = make_grid((samples+1)/2, nrow=closest_factors(b))
-            make_grid(grid, os.path.join(sample_dir, f'sample_{step//interval}.png'))
+            save_image(grid, os.path.join(sample_dir, f'sample_{step//interval}.png'))
 
         # save model ever a few steps
         if step % interval == 0:
-            torch.save(model.state_dict(), f'model_{step//interval}.pt')
+            torch.save(model.state_dict(), os.path.join(model_dir, f'model_{step//interval}.pt'))
 
         pbar.update(1)
 
