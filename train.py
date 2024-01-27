@@ -13,6 +13,12 @@ from multiprocessing import cpu_count
 
 from tensorboardX import SummaryWriter
 
+# device
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+
 def cycle(dl):
     while True:
         for data in dl:
@@ -91,7 +97,7 @@ model = Unet(
     dim_mults = (1, 2, 4, 8),
     channels = 3,
     flash_attn = True
-)
+).to(device)
 ema_model = copy.deepcopy(model)
 optim = torch.optim.Adam(model.parameters(), lr=lr)
 sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
@@ -100,7 +106,7 @@ sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
 step = 0
 with tqdm(total_steps, dynamic_ncols=True) as pbar:
     while step < total_steps:
-        img, label = next(dl)
+        img, label = next(dl).to(device)
         unique_labels = torch.unique(label)
         find_label, _ = torch.max(torch.eq(all_labels_th, unique_labels[:, None]), dim=0)
         eps_dataset = all_imgs[find_label]
