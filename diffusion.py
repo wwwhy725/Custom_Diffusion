@@ -19,31 +19,34 @@ def linear_beta_schedule(timesteps):
     scale = 1000 / timesteps
     beta_start = scale * 0.0001
     beta_end = scale * 0.02
-    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
+    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float32)
 
 
-class DiffusionTrainer(nn.Mondule):
+class DiffusionTrainer(nn.Module):
     def __init__(
         self,
         model, 
         epsilon_star_data: np.ndarray,
+        device, 
         timesteps: int=1000
     ):
         super().__init__()
         self.model = model
         self.eps_star_data = epsilon_star_data
 
+        self.timesteps = timesteps
+        self.device = device
+
         # betas and alphas
-        self.register_buffer('betas', linear_beta_schedule(timesteps))
+        self.register_buffer('betas', linear_beta_schedule(timesteps).to(self.device))
 
         alphas = 1. - self.betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
 
         # calculations for diffusion q(x_t | x_{t-1}) and others
-        self.register_buffer(
-            'sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
-        self.register_buffer(
-            'sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
         
     def epsilon_star_batch(self, x, t, data: np.ndarray, batch_size=1000):
         device = self.device
@@ -108,10 +111,10 @@ class DiffusionTrainer(nn.Mondule):
         return loss
 
 class DiffusionSampler(nn.Module):
-    def __init__(self, model, sample_timesteps:int=1000, timesteps:int=1000):
+    def __init__(self, model, device, sample_timesteps:int=1000, timesteps:int=1000):
         super().__init__()
-
         self.model = model
+        self.device = device
         self.timesteps = timesteps
         self.sample_time_step = sample_timesteps
         if sample_timesteps < timesteps:
@@ -120,25 +123,20 @@ class DiffusionSampler(nn.Module):
             self.sample_method = 'ddpm'
 
         # betas and alphas
-        betas = linear_beta_schedule(timesteps)
+        betas = linear_beta_schedule(timesteps).to(self.device)
         self.register_buffer('betas', betas)
         alphas = 1. - self.betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
-        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
-        self.register_buffer('betas', betas)
-        self.register_buffer('alphas_cumprod', alphas_cumprod)
-        self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
-        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
-        
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)        
         
         # ddpm coeff
-        self.register_buffer('sigma', torch.sqrt(self.betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)))
-        self.register_buffer('eps_coeff', betas / torch.sqrt(alphas*(1. - alphas_cumprod)))
-        self.register_buffer('x_coeff', 1. / torch.sqrt(alphas))
-
+        if self.sample_method == 'ddpm':
+            self.register_buffer('sigma', torch.sqrt(self.betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)))
+            self.register_buffer('eps_coeff', betas / torch.sqrt(alphas*(1. - alphas_cumprod)))
+            self.register_buffer('x_coeff', 1. / torch.sqrt(alphas))
         # ddim coeff
-        self.register_buffer('eps_coeff_ddim', torch.sqrt(1. - alphas_cumprod_prev) - torch.sqrt(1. - alphas_cumprod)/torch.sqrt(alphas))
+        elif self.sample_method == 'ddim':
+            self.register_buffer('eps_coeff_ddim', torch.sqrt(1. - alphas_cumprod_prev) - torch.sqrt(1. - alphas_cumprod)/torch.sqrt(alphas))
 
 
     def forward(self, x_T):
@@ -147,26 +145,29 @@ class DiffusionSampler(nn.Module):
         """
         b, c, h, w = x_T.shape
         x_t = x_T
-        if self.sample_method == 'ddpm':
-            for time_step in tqdm(reversed(range(self.timesteps)), desc = 'sampling loop time step', total = self.sample_time_step):  # tbd
-                t = torch.full((b,), time_step, decice='cuda')
-                eps = self.model(x_t, t)
-                z = torch.randn_like(x_t)
-                gamma = extract(self.eps_coeff, t, x_t.shape)*eps - extract(self.sigma, t, z.shape)*z
-                x_t = extract(self.x_coeff, t, x_t.shape)*x_t - gamma
-            x_0 = x_t
-        elif self.sample_method == 'ddim':
-            times = torch.linspace(-1, self.timesteps - 1, steps = self.sample_time_step + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-            times = list(reversed(times.int().tolist()))
-            time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-            for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):  # tbd
-                t = torch.full((b,), time, decice='cuda')
-                eps = self.model(x_t, t)
-                z = torch.randn_like(x_t)
-                gamma = extract(self.eps_coeff, t, x_t.shape)*eps - extract(self.sigma, t, z.shape)*z
-                x_t = extract(self.x_coeff, t, x_t.shape)*x_t - gamma
-            x_0 = x_t
-        else:
-            raise NotImplementedError(self.sample_method)
+        model = self.model
+        model.eval()
+        with torch.no_grad():
+            if self.sample_method == 'ddpm':
+                for time_step in tqdm(reversed(range(self.timesteps)), desc = 'sampling loop time step', total = self.sample_time_step):  # tbd
+                    t = torch.full((b,), time_step, device=self.device)
+                    eps = model(x_t, t)
+                    z = torch.randn_like(x_t)
+                    gamma = extract(self.eps_coeff, t, x_t.shape)*eps - extract(self.sigma, t, z.shape)*z
+                    x_t = extract(self.x_coeff, t, x_t.shape)*x_t - gamma
+                x_0 = x_t
+            elif self.sample_method == 'ddim':
+                times = torch.linspace(-1, self.timesteps - 1, steps = self.sample_time_step + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+                times = list(reversed(times.int().tolist()))
+                time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+                for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):  # tbd
+                    t = torch.full((b,), time, device=self.device)
+                    eps = model(x_t, t)
+                    z = torch.randn_like(x_t)
+                    gamma = extract(self.eps_coeff, t, x_t.shape)*eps - extract(self.sigma, t, z.shape)*z
+                    x_t = extract(self.x_coeff, t, x_t.shape)*x_t - gamma
+                x_0 = x_t
+            else:
+                raise NotImplementedError(self.sample_method)
 
         return torch.clip(x_0, -1, 1)

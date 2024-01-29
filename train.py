@@ -39,7 +39,7 @@ def closest_factors(a):
     closest_factor = min(factors, key=lambda x: abs(x[0] - x[1]))
     return closest_factor
 
-def warmup_lr(step, warmup:int=5000):
+def warmup_lr(step, warmup:int=1000):
     return min(step, warmup) / warmup
 
 def ema(source, target, decay):
@@ -60,6 +60,23 @@ create_directory(model_dir)
 writer = SummaryWriter(logdir)
 writer.flush()
 
+# parameters
+batch_size = 128
+lr = 1e-4
+grad_clip = 1.
+ema_decay = 0.9999
+total_steps = 100000
+b, c, h, w = 16, 3, 32, 32  # for sample
+interval = 5000
+unet_dim = 256
+writer.add_scalar('hyperparameters/batch_size', batch_size, 0)
+writer.add_scalar('hyperparameters/lr', lr, 0)
+writer.add_scalar('hyperparameters/grad_clip', grad_clip, 0)
+writer.add_scalar('hyperparameters/ema_decay', ema_decay, 0)
+writer.add_scalar('hyperparameters/total_steps', total_steps, 0)
+writer.add_scalar('hyperparameters/unet_dim', unet_dim, 0)
+writer.add_scalar('hyperparameters/warmup', 1000, 0)
+
 # dataset
 class CustomDataset(Dataset):
     def __init__(self, data_path, labels_path):
@@ -78,22 +95,14 @@ data_path = '/mnt/store/lyx/github_projs/why/DDPM/all_cifar_sorted.npy'
 label_path = '/mnt/store/lyx/github_projs/why/DDPM/kmeans_labels_cifar.npy'
 all_imgs = np.load(data_path)
 all_labels = np.load(label_path)
-all_labels_th = torch.tensor(all_labels)
+all_labels_th = torch.tensor(all_labels).to(device)
 mydata = CustomDataset(data_path=data_path, labels_path=label_path)
-dataloader = DataLoader(mydata, batch_size=128, shuffle=False, pin_memory=True, num_workers=cpu_count()//2)
+dataloader = DataLoader(mydata, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=cpu_count()//2)
 dl = cycle(dataloader)
-
-# parameters
-lr = 1e-4
-grad_clip = 1.
-ema_decay = 0.9999
-total_steps = 100000
-b, c, h, w = 16, 3, 32, 32
-interval = 5000
 
 # model set up
 model = Unet(
-    dim = 256,
+    dim = unet_dim,
     dim_mults = (1, 2, 4, 8),
     channels = 3,
     flash_attn = True
@@ -104,18 +113,21 @@ sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
 
 # train
 step = 0
-with tqdm(total_steps, dynamic_ncols=True) as pbar:
+with tqdm(initial = step, total = total_steps, dynamic_ncols=True) as pbar:
     while step < total_steps:
-        img, label = next(dl).to(device)
+        img, label = next(dl)
+        img = img.to(device)
+        label = label.to(device)
         unique_labels = torch.unique(label)
         find_label, _ = torch.max(torch.eq(all_labels_th, unique_labels[:, None]), dim=0)
-        eps_dataset = all_imgs[find_label]
+        eps_dataset = all_imgs[find_label.cpu().detach().numpy()]
 
         # train
         optim.zero_grad()
         trainer = DiffusionTrainer(
             model=model,
             epsilon_star_data=eps_dataset,
+            device=device
         )
         loss = trainer(img).mean()
         loss.backward()
@@ -130,16 +142,15 @@ with tqdm(total_steps, dynamic_ncols=True) as pbar:
 
         # log
         writer.add_scalar('loss', loss, step)
-        pbar.set_postfix(loss='%.3f' % loss)
+        pbar.set_description(f'loss: {loss:.4f}')
 
         # sample every a few steps
         if step % interval == 0:
-            diffusion_sampler = DiffusionSampler(model, sample_timesteps=1000)
-            init_noise = torch.randn(b, c, h, w).to('cuda')
+            diffusion_sampler = DiffusionSampler(model, device, sample_timesteps=1000)
+            init_noise = torch.randn(b, c, h, w).to(device)
             samples = diffusion_sampler(init_noise)
-            grid = make_grid((samples+1)/2, nrow=closest_factors(b))
+            grid = make_grid((samples+1)/2, nrow=closest_factors(b)[0])
             save_image(grid, os.path.join(sample_dir, f'sample_{step//interval}.png'))
-
         # save model ever a few steps
         if step % interval == 0:
             torch.save(model.state_dict(), os.path.join(model_dir, f'model_{step//interval}.pt'))
